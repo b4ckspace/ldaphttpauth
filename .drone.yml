@@ -9,6 +9,7 @@ steps:
     commands:
       - apk add --no-cache git
       - go build -o ldaphttpauth .
+      - tar zcf ldaphttpauth.tar.gz ldaphttpauth
 
   - name: release
     image: plugins/github-release
@@ -16,10 +17,8 @@ steps:
       api_key:
         from_secret: github_token
       files:
-        - ldaphttpauth
+        - ldaphttpauth.tar.gz
       checksum:
-        - md5
-        - sha1
         - sha256
     when:
       event: tag
