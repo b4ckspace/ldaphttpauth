@@ -32,6 +32,10 @@ func main() {
 	if !found {
 		log.Fatal("LDAP_BIND environment variable must be specified.")
 	}
+	httpBind, found := os.LookupEnv("HTTP_BIND")
+	if !found {
+		httpBind = ":8042"
+	}
 	pc := &PasswordChecker{
 		ldapHost:    ldapHost,
 		tlsHostname: tlsHostname,
@@ -49,7 +53,7 @@ func main() {
 			fmt.Fprintf(w, "OK")
 		}
 	})
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(httpBind, nil))
 }
 
 type PasswordChecker struct {
