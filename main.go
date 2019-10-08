@@ -82,6 +82,9 @@ func (pc *PasswordChecker) checkPassword(username, password string) bool {
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
 			return false
 		}
+		if ldap.IsErrorWithCode(err, ldap.ErrorEmptyPassword) {
+			return false
+		}
 		// This should not happen unless you have configuration errors
 		log.Fatal(err)
 	}
