@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/sha512"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"gopkg.in/ldap.v3"
 )
@@ -41,19 +44,65 @@ func main() {
 		tlsHostname: tlsHostname,
 		bind:        ldapBind,
 	}
+	cache := new(sync.Map)
+	maxLifetime := 10 * time.Minute
 	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
 		authHeaderValue := fmt.Sprintf("Basic real=%s", realm)
 		w.Header().Add("WWW-Authenticate", authHeaderValue)
 		username, password, ok := r.BasicAuth()
-		if !ok || !pc.checkPassword(username, password) {
+		if !ok {
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprintf(w, "DENIED")
-		} else {
+		}
+		var cacheKey [128]byte
+		userHash := sha512.Sum512([]byte(username))
+		pwHash := sha512.Sum512([]byte(password))
+		copy(cacheKey[0:64], userHash[:])
+		copy(cacheKey[64:128], pwHash[:])
+		cacheValue, ok := cache.Load(cacheKey)
+		if ok {
+			expireTime := cacheValue.(time.Time)
+			if time.Since(expireTime) <= maxLifetime {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "OK")
+				cache.Store(cacheKey, time.Now())
+				return
+			}
+		}
+		if pc.checkPassword(username, password) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "OK")
+			cache.Store(cacheKey, time.Now())
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintf(w, "DENIED")
 		}
 	})
+	ticker := time.NewTicker(time.Minute)
+	done := make(chan bool)
+	defer ticker.Stop()
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				cache.Range(func(key, value interface{}) bool {
+					expireTime := value.(time.Time)
+					if time.Since(expireTime) > maxLifetime {
+						cache.Delete(key)
+						keyArr := key.([128]byte)
+						for i := 0; i < len(keyArr); i++ {
+							keyArr[i] = 0
+						}
+					}
+					return true
+				})
+			}
+		}
+	}()
 	log.Fatal(http.ListenAndServe(httpBind, nil))
+	done <- true
 }
 
 type PasswordChecker struct {
