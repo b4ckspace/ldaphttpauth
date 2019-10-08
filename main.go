@@ -63,6 +63,9 @@ type PasswordChecker struct {
 }
 
 func (pc *PasswordChecker) checkPassword(username, password string) bool {
+	if strings.TrimSpace(password) == "" {
+		return false
+	}
 	conn, err := ldap.Dial("tcp", pc.ldapHost)
 	defer conn.Close()
 	if err != nil {
