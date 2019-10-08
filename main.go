@@ -63,6 +63,9 @@ type PasswordChecker struct {
 }
 
 func (pc *PasswordChecker) checkPassword(username, password string) bool {
+	if strings.TrimSpace(username) == "" {
+		return false
+	}
 	if strings.TrimSpace(password) == "" {
 		return false
 	}
