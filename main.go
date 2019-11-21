@@ -1,137 +1,151 @@
 package main
 
 import (
+	"context"
 	"crypto/sha512"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/ldap.v3"
 )
 
+type (
+	config struct {
+		Realm           string `default:"Authentication"`
+		LdapHost        string `required:"true"`
+		LdapBind        string `required:"true"`
+		LdapTLSHostname string
+		HttpBind        string `default:":8042"`
+	}
+)
+
 func main() {
-	realm, found := os.LookupEnv("REALM")
-	if !found {
-		realm = "Authentication"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := config{}
+	err := envconfig.Process("", &c)
+	if err != nil {
+		log.Fatalf("unable to load config: %s", err)
 	}
-	ldapHost, found := os.LookupEnv("LDAP_HOST")
-	if !found {
-		log.Fatal("LDAP_HOST environment variable must be specified.")
-	}
-	tlsHostname, found := os.LookupEnv("LDAP_TLS_HOSTNAME")
-	if !found {
-		if strings.Contains(ldapHost, ":") {
-			tlsHostname = ldapHost[:strings.Index(ldapHost, ":")]
+	if c.LdapTLSHostname == "" {
+		if strings.Contains(c.LdapHost, ":") {
+			c.LdapTLSHostname = c.LdapHost[:strings.Index(c.LdapHost, ":")]
 		} else {
-			tlsHostname = ldapHost
+			c.LdapTLSHostname = c.LdapHost
 		}
 	}
-	ldapBind, found := os.LookupEnv("LDAP_BIND")
-	if !found {
-		log.Fatal("LDAP_BIND environment variable must be specified.")
+	log.Printf("%+v", c)
+
+	pc, err := NewPasswordChecker(ctx, c.LdapHost, c.LdapTLSHostname, c.HttpBind, &c)
+	if err != nil {
+		log.Fatalf("unable to connect ldap: %s", err)
 	}
-	httpBind, found := os.LookupEnv("HTTP_BIND")
-	if !found {
-		httpBind = ":8042"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth", pc.handleAuth)
+	middlewared := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			next.ServeHTTP(w, r)
+			delta := time.Since(start)
+			log.Printf("%s %s %s", r.Method, r.URL.String(), delta.String())
+		})
+	}(mux)
+	go func() { _ = http.ListenAndServe(c.HttpBind, middlewared) }()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	select {
+	case s := <-sig:
+		log.Printf("received %s, shutting down.", s)
+		return
 	}
-	pc := &PasswordChecker{
-		ldapHost:    ldapHost,
-		tlsHostname: tlsHostname,
-		bind:        ldapBind,
-	}
-	cache := new(sync.Map)
-	maxLifetime := 10 * time.Minute
-	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
-		authHeaderValue := fmt.Sprintf("Basic real=%s", realm)
-		w.Header().Add("WWW-Authenticate", authHeaderValue)
-		username, password, ok := r.BasicAuth()
-		if !ok {
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprintf(w, "DENIED")
-		}
-		var cacheKey [128]byte
-		userHash := sha512.Sum512([]byte(username))
-		pwHash := sha512.Sum512([]byte(password))
-		copy(cacheKey[0:64], userHash[:])
-		copy(cacheKey[64:128], pwHash[:])
-		cacheValue, ok := cache.Load(cacheKey)
-		if ok {
-			expireTime := cacheValue.(time.Time)
-			if time.Since(expireTime) <= maxLifetime {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprintf(w, "OK")
-				cache.Store(cacheKey, time.Now())
-				return
-			}
-		}
-		if pc.checkPassword(username, password) {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "OK")
-			cache.Store(cacheKey, time.Now())
-		} else {
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprintf(w, "DENIED")
-		}
-	})
-	ticker := time.NewTicker(time.Minute)
-	done := make(chan bool)
-	defer ticker.Stop()
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				cache.Range(func(key, value interface{}) bool {
-					expireTime := value.(time.Time)
-					if time.Since(expireTime) > maxLifetime {
-						cache.Delete(key)
-						keyArr := key.([128]byte)
-						for i := 0; i < len(keyArr); i++ {
-							keyArr[i] = 0
-						}
-					}
-					return true
-				})
-			}
-		}
-	}()
-	log.Fatal(http.ListenAndServe(httpBind, nil))
-	done <- true
+
 }
 
 type PasswordChecker struct {
 	ldapHost    string
 	tlsHostname string
 	bind        string
+	config      *config
+	cache       *sync.Map
+	ttl         time.Duration
 }
 
-func (pc *PasswordChecker) checkPassword(username, password string) bool {
+func NewPasswordChecker(ctx context.Context, ldapHost, tlsHostname, bind string, c *config) (pc *PasswordChecker, err error) {
+	pc = &PasswordChecker{
+		ldapHost:    ldapHost,
+		tlsHostname: tlsHostname,
+		bind:        bind,
+		config:      c,
+		cache:       &sync.Map{},
+		ttl:         10 * time.Second,
+	}
+	conn, err := pc.dailTLS()
+	if err != nil {
+		return nil, err
+	}
+	conn.Close()
+
+	ticker := time.NewTicker(time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+			case <-ticker.C:
+				pc.cache.Range(func(key, value interface{}) bool {
+					expireTime := value.(time.Time)
+					if time.Since(expireTime) > pc.ttl {
+						pc.cache.Delete(key)
+					}
+					return true
+				})
+			}
+		}
+	}()
+
+	return pc, nil
+}
+
+func (pc *PasswordChecker) dailTLS() (conn *ldap.Conn, err error) {
+	conn, err = ldap.Dial("tcp", pc.ldapHost)
+	if err != nil {
+		return nil, fmt.Errorf("error connection to LDAP: %s", err)
+	}
+	err = conn.StartTLS(&tls.Config{
+		ServerName: pc.tlsHostname,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error with STARTTLS: %s", err)
+	}
+	return conn, nil
+}
+
+func (pc *PasswordChecker) CheckPassword(username, password string) bool {
 	if strings.TrimSpace(username) == "" {
 		return false
 	}
 	if strings.TrimSpace(password) == "" {
 		return false
 	}
-	conn, err := ldap.Dial("tcp", pc.ldapHost)
+	conn, err := pc.dailTLS()
+	if err != nil {
+		log.Printf("unable to verify password for '%s': %s", username, err)
+		return false
+	}
 	defer conn.Close()
-	if err != nil {
-		log.Println(fmt.Sprintf("Error connection to LDAP: %s", err))
-		return false
-	}
-	err = conn.StartTLS(&tls.Config{
-		ServerName: pc.tlsHostname,
-	})
-	if err != nil {
-		log.Println(fmt.Sprintf("Error with STARTTLS: %s", err))
-		return false
-	}
-	bindStr := fmt.Sprintf(pc.bind, ldap.EscapeFilter(username))
+
+	bindStr := fmt.Sprintf(pc.config.LdapBind, ldap.EscapeFilter(username))
+	log.Print(bindStr)
 	err = conn.Bind(bindStr, password)
 	if err != nil {
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
@@ -144,4 +158,35 @@ func (pc *PasswordChecker) checkPassword(username, password string) bool {
 		log.Fatal(err)
 	}
 	return true
+}
+
+func (pc *PasswordChecker) handleAuth(w http.ResponseWriter, r *http.Request) {
+	authHeaderValue := fmt.Sprintf("Basic real=%s", pc.config.Realm)
+	w.Header().Add("WWW-Authenticate", authHeaderValue)
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, "DENIED")
+	}
+	hash := sha512.New()
+	_, _ = hash.Write([]byte(username))
+	_, _ = hash.Write([]byte(password))
+	cacheIdent := hash.Sum([]byte{})
+	cacheKey := string(cacheIdent)
+
+	_, ok = pc.cache.Load(cacheKey)
+	if ok {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+		pc.cache.Store(cacheKey, time.Now())
+		return
+	}
+	if pc.CheckPassword(username, password) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+		pc.cache.Store(cacheKey, time.Now())
+	} else {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, "DENIED")
+	}
 }
